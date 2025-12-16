@@ -1,102 +1,85 @@
-# fantasy_nfl.py
-from flask import Flask, request
-import webbrowser
+import os
+from flask import Flask, request, redirect
 import requests
 import pandas as pd
-import threading
-import time
 
 # -----------------------------
-# VUL HIER JE APP GEGEVENS IN
-CLIENT_ID = '49185'
-CLIENT_SECRET = '4ead520ed7e5af90a0741046c64c8cd03d974b90'  
-REDIRECT_URI = 'https://defeatedly-discalced-lavone.ngrok-free.dev/callback' # Exact zoals in je Yahoo-app
+# CONFIGURATIE
+# -----------------------------
+LEAGUE_ID = "49185"
+CLIENT_ID = os.environ.get("YAHOO_CLIENT_ID")       # Zet dit in Render Environment
+CLIENT_SECRET = os.environ.get("YAHOO_CLIENT_SECRET")  # Zet dit in Render Environment
+REDIRECT_URI = os.environ.get("REDIRECT_URI")       # Bijvoorbeeld https://fantasy-nfl.onrender.com/callback
 
+# Flask app
 app = Flask(__name__)
-auth_code = None
 
 # -----------------------------
-# Open browser voor Yahoo login
-auth_url = f"https://api.login.yahoo.com/oauth2/request_auth?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&language=en-us"
-print("De browser wordt geopend voor Yahoo login...")
-webbrowser.open(auth_url)
-
+# ROUTES
 # -----------------------------
-# Callback route
-@app.route('/callback')
+@app.route("/")
+def index():
+    # Yahoo OAuth URL
+    auth_url = (
+        f"https://api.login.yahoo.com/oauth2/request_auth?"
+        f"client_id={CLIENT_ID}&response_type=code&redirect_uri={REDIRECT_URI}"
+    )
+    return redirect(auth_url)
+
+@app.route("/callback")
 def callback():
-    global auth_code
-    auth_code = request.args.get('code')
-    return "OAuth code ontvangen! Sluit deze browser en ga terug naar het script."
+    code = request.args.get("code")
+    if not code:
+        return "Geen code ontvangen van Yahoo."
+
+    # OAuth access token aanvragen
+    token_url = "https://api.login.yahoo.com/oauth2/get_token"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    data = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "redirect_uri": REDIRECT_URI,
+        "code": code,
+        "grant_type": "authorization_code"
+    }
+    response = requests.post(token_url, headers=headers, data=data)
+    if response.status_code != 200:
+        return f"Fout bij ophalen access token: {response.text}"
+
+    token_info = response.json()
+    access_token = token_info["access_token"]
+
+    # Data ophalen (voorbeeld: teams, standings)
+    api_url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{LEAGUE_ID}/standings?format=json"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    api_response = requests.get(api_url, headers=headers)
+
+    if api_response.status_code != 200:
+        return f"Fout bij ophalen league data: {api_response.text}"
+
+    league_data = api_response.json()
+
+    # Data verwerken naar DataFrame
+    teams = league_data["fantasy_content"]["league"][1]["standings"]["teams"]
+    data_list = []
+    for team_entry in teams:
+        team = team_entry["team"][0]
+        name = team["name"]
+        wins = team["team_standings"]["outcome_totals"]["wins"]
+        losses = team["team_standings"]["outcome_totals"]["losses"]
+        data_list.append({"Team": name, "Wins": wins, "Losses": losses})
+
+    df = pd.DataFrame(data_list)
+
+    # Opslaan als Excel
+    excel_file = "fantasy_league.xlsx"
+    df.to_excel(excel_file, index=False)
+
+    return f"Data opgehaald en opgeslagen in {excel_file}!"
 
 # -----------------------------
-# Start Flask in een aparte thread
-def run_flask():
-    app.run(port=8080)
-
-flask_thread = threading.Thread(target=run_flask)
-flask_thread.start()
-
-# Wacht tot de code is ontvangen
-while auth_code is None:
-    time.sleep(1)
-
+# MAIN
 # -----------------------------
-# Haal access token op
-token_url = "https://api.login.yahoo.com/oauth2/get_token"
-data = {
-    'grant_type': 'authorization_code',
-    'code': auth_code,
-    'redirect_uri': REDIRECT_URI,
-    'client_id': CLIENT_ID,
-    'client_secret': CLIENT_SECRET
-}
-response = requests.post(token_url, data=data)
-tokens = response.json()
-access_token = tokens['access_token']
-print("Access token ontvangen!")
-
-# -----------------------------
-# Haal League IDs op
-headers = {"Authorization": f"Bearer {access_token}"}
-url = "https://fantasysports.yahooapis.com/fantasy/v2/users;use_login=1/games;game_keys=nfl/leagues?format=json"
-response = requests.get(url, headers=headers)
-data = response.json()
-
-league_ids = {}
-leagues = data['fantasy_content']['users'][0]['user'][1]['games']['0']['game'][1]['leagues']
-for league in leagues:
-    season = league['league'][0]['season']
-    league_key = league['league'][0]['league_key']
-    if int(season) >= 2012:
-        league_ids[int(season)] = league_key
-
-print("League IDs per seizoen:", league_ids)
-
-# -----------------------------
-# Data ophalen en Excel maken
-all_seasons_data = []
-
-for year, league_key in sorted(league_ids.items()):
-    print(f"Ophalen van seizoen {year}...")
-    url = f"https://fantasysports.yahooapis.com/fantasy/v2/league/{league_key}/standings?format=json"
-    response = requests.get(url, headers=headers)
-    data = response.json()
-    
-    teams = data['fantasy_content']['league'][1]['standings']['0']['teams']
-    for team in teams:
-        t = team['team'][0]
-        all_seasons_data.append({
-            "Seizoen": year,
-            "Team": t['name'],
-            "Manager": t['managers'][0]['nickname'],
-            "Points": t['team_points']['total']['points'],
-            "Wins": t['team_stats']['outcome_totals']['wins'],
-            "Losses": t['team_stats']['outcome_totals']['losses'],
-            "Ties": t['team_stats']['outcome_totals']['ties']
-        })
-
-df = pd.DataFrame(all_seasons_data)
-excel_filename = "FantasyNFL_2012_heden.xlsx"
-df.to_excel(excel_filename, index=False)
-print(f"Excel-bestand aangemaakt: {excel_filename}")
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
